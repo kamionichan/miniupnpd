@@ -1,0 +1,104 @@
+name: Sync miniupnpd subdir to root
+
+on:
+  schedule:
+    - cron: "0 3 * * *"  # 每天 UTC 03:00 运行，按需修改
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-miniupnpd
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout target repo (your repo)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git author
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Detect your default branch
+        id: def
+        shell: bash
+        run: |
+          # actions/checkout 默认检出你的默认分支
+          DEFAULT_BRANCH="$(git branch --show-current)"
+          echo "DEFAULT_BRANCH=$DEFAULT_BRANCH" >> "$GITHUB_ENV"
+          echo "default-branch=$DEFAULT_BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Detect upstream default branch
+        id: upstream
+        shell: bash
+        run: |
+          set -e
+          # 自动探测 miniupnp/miniupnp 的默认分支
+          UPSTREAM_DEFAULT=$(git ls-remote --symref https://github.com/miniupnp/miniupnp.git HEAD | sed -n 's#^ref: refs/heads/\(.*\)\tHEAD#\1#p')
+          echo "UPSTREAM_REF=$UPSTREAM_DEFAULT" >> "$GITHUB_ENV"
+          echo "upstream-ref=$UPSTREAM_DEFAULT" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch upstream subdir via sparse-checkout (temp dir)
+        shell: bash
+        run: |
+          set -e
+          UP_DIR="$(mktemp -d)"
+          echo "UP_DIR=$UP_DIR" >> "$GITHUB_ENV"
+          git clone --filter=blob:none --no-checkout https://github.com/miniupnp/miniupnp.git "$UP_DIR/repo"
+          cd "$UP_DIR/repo"
+          git sparse-checkout init --cone
+          git sparse-checkout set miniupnpd
+          git checkout "$UPSTREAM_REF"
+          echo "UPSTREAM_SHA=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+      
+      - name: Prepare/update upstream-snapshot branch (only snapshot content)
+        shell: bash
+        run: |
+          set -e
+          if git ls-remote --exit-code origin upstream-snapshot >/dev/null 2>&1; then
+            git fetch origin upstream-snapshot:upstream-snapshot
+            git checkout upstream-snapshot
+          else
+            git checkout -B upstream-snapshot "$DEFAULT_BRANCH"
+          fi
+      
+          # 清空工作区（保留 .git 和 .github）
+          find . -mindepth 1 -maxdepth 1 ! -name ".git" ! -name ".github" -exec rm -rf {} +
+      
+          # 从临时目录拷贝 miniupnpd 到根目录
+          rsync -a --delete --exclude ".git" --exclude ".github" "$UP_DIR/repo/miniupnpd/" .
+      
+          if [ -n "$(git status --porcelain)" ]; then
+            git add -A
+            git commit -m "chore(snapshot): miniupnp/miniupnp miniupnpd @ $UPSTREAM_SHA ($UPSTREAM_REF)"
+          else
+            echo "No snapshot changes."
+          fi
+      
+          git push -u origin upstream-snapshot
+      
+
+      - name: Merge snapshot into your default branch (fail on conflicts)
+        shell: bash
+        run: |
+          set -e
+          # 切回你的默认分支，确保是最新
+          git checkout "$DEFAULT_BRANCH"
+          git pull --ff-only origin "$DEFAULT_BRANCH"
+
+          # 正常三方合并，不做 ours/theirs 偏向；如冲突则非零退出，任务失败
+          if git merge --no-ff upstream-snapshot -m "chore(sync): merge upstream-snapshot ($UPSTREAM_SHA)"; then
+            # 只有合并成功才推送
+            git push origin "$DEFAULT_BRANCH"
+            echo "Merged and pushed."
+          else
+            echo "Merge conflict detected. Please resolve locally."
+            exit 1
+          fi
